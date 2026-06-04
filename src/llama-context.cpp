@@ -313,6 +313,8 @@ llama_context::llama_context(
         cparams.causal_attn = params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
     }
 
+    cparams.n_kq_bidir_tail = 0;
+
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
@@ -1373,6 +1375,12 @@ void llama_context::set_causal_attn(bool value) {
 
 bool llama_context::get_causal_attn() const {
     return cparams.causal_attn;
+}
+
+void llama_context::set_attn_bidirectional_tail(int32_t n) {
+    // Only changes KQ mask values (filled fresh every decode via set_inputs), so unlike
+    // set_causal_attn this does NOT require a graph rebuild.
+    cparams.n_kq_bidir_tail = n;
 }
 
 void llama_context::set_warmup(bool value) {
@@ -4205,6 +4213,10 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 bool llama_get_causal_attn(const llama_context * ctx) {
     return ctx->get_causal_attn();
+}
+
+void llama_set_attn_bidirectional_tail(llama_context * ctx, int32_t n) {
+    ctx->set_attn_bidirectional_tail(n);
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {

@@ -36,6 +36,11 @@ struct llama_cparams {
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool causal_attn;
+    // grounding (Parallel Box Decoding): make the last n_kq_bidir_tail query tokens of
+    // a ubatch attend to each other bidirectionally (a non-causal window) while the rest
+    // of the sequence stays causal. 0 = fully causal (default). Only affects mask values,
+    // so it does not trigger a graph re-reservation when changed between decodes.
+    int32_t n_kq_bidir_tail;
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;

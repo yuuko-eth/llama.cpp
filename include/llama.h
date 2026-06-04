@@ -1116,6 +1116,13 @@ extern "C" {
     // Returns whether the context is currently using causal attention
     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
 
+    // Make the last `n` query tokens of each decoded ubatch attend to one another
+    // bidirectionally (a non-causal window) while the rest of the sequence stays causal.
+    // Used for block/parallel decoding (e.g. LocateAnything Parallel Box Decoding).
+    // 0 = fully causal (default). Unlike llama_set_causal_attn this only changes mask
+    // values, so the graph can be reused between decodes (no rebuild, no re-reservation).
+    LLAMA_API void llama_set_attn_bidirectional_tail(struct llama_context * ctx, int32_t n);
+
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     //
