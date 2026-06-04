@@ -474,7 +474,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
     if (self_kq_mask && self_kq_mask->buffer) {
-        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn, cparams.n_kq_bidir_tail);
     }
 
     if (self_k_rot && self_k_rot->buffer) {

@@ -1549,6 +1549,11 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+
+    // bidirectional window (Parallel Box Decoding): query/key cells whose position is
+    // >= bidir_min_pos may attend to each other even when p0 > p1. Disabled when
+    // bidir_min_pos == INT32_MAX.
+    llama_pos bidir_min_pos;
 };
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
@@ -1664,7 +1669,11 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 if (causal) {
                     // mask future tokens
                     if (p0 > p1) {
-                        goto skip;
+                        // bidirectional window: query and key are both inside the
+                        // non-causal tail block, so let them attend to each other.
+                        if (!(p1 >= args.bidir_min_pos && p0 >= args.bidir_min_pos)) {
+                            goto skip;
+                        }
                     }
 
                     // M-RoPE causal mask
@@ -1741,7 +1750,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
-void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, int32_t n_bidir_tail) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -1760,6 +1769,25 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
     }
 
+    // bidirectional tail: the last n_bidir_tail query tokens form a non-causal
+    // window. They occupy the highest positions in the ubatch, so the smallest of
+    // those positions is the threshold above which p0 > p1 attention is allowed.
+    //
+    // NOTE: this and non_causal_type (just above) are two independent mechanisms
+    // feeding the same mask. non_causal_type toggles `causal_attn` wholesale, per
+    // cache/layer, in response to llama_set_causal_attn(false); the bidirectional
+    // tail only relaxes p0 > p1 for positions >= bidir_min_pos and is a no-op once
+    // `causal_attn` is false. Grounding (Parallel Box Decoding) uses the tail only
+    // and never calls llama_set_causal_attn, so today the two cannot both be
+    // active; if a future model wants both, non_causal_type is resolved first and
+    // the tail then applies to whatever layers came back causal.
+    llama_pos bidir_min_pos = INT32_MAX;
+    if (n_bidir_tail > 0 && (int32_t) n_tokens >= n_bidir_tail) {
+        for (uint32_t i = n_tokens - n_bidir_tail; i < n_tokens; ++i) {
+            bidir_min_pos = std::min(bidir_min_pos, ubatch->pos[i]);
+        }
+    }
+
     //const int64_t t_start = ggml_time_us();
 
     const args_set_input_kq_mask args = {
@@ -1772,6 +1800,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.bidir_min_pos    =*/ bidir_min_pos,
     };
 
     if (dst->type == GGML_TYPE_F16) {
@@ -2794,8 +2823,8 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
 }
 
-void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv->set_input_kq_mask(dst, ubatch, causal_attn);
+void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, int32_t n_bidir_tail) const {
+    kv->set_input_kq_mask(dst, ubatch, causal_attn, n_bidir_tail);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

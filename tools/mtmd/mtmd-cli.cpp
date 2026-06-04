@@ -270,9 +270,11 @@ static int generate_response_grounding(mtmd_cli_context & ctx, int n_predict) {
                 common_batch_add(win, tok.mask, G - 1 + i, {0}, true);  // slots 1..: <text_mask>
             }
 
-            llama_set_causal_attn(ctx.lctx, false);
+            // the n_future window tokens attend to each other bidirectionally (a
+            // non-causal block) while staying causal to the prefix. This only changes
+            // KQ-mask values, so it does not re-reserve the graph between decodes.
+            llama_set_attn_bidirectional_tail(ctx.lctx, n_future);
             const int rc = llama_decode(ctx.lctx, win);
-            llama_set_causal_attn(ctx.lctx, true);
             if (rc) { LOG_ERR("grounding: window decode failed\n"); break; }
 
             std::vector<const float *> rows(n_future);
@@ -313,7 +315,9 @@ static int generate_response_grounding(mtmd_cli_context & ctx, int n_predict) {
             }
             fflush(stdout);
 
-            // catch-up: causally rebuild KV for [last_tok, accepted tokens...]
+            // catch-up: causally rebuild KV for [last_tok, accepted tokens...].
+            // tail=0 → fully causal so the committed tokens get faithful causal KV.
+            llama_set_attn_bidirectional_tail(ctx.lctx, 0);
             common_batch_clear(cat);
             common_batch_add(cat, last_tok, G - 1, {0}, false);
             llama_pos p = G;
@@ -354,6 +358,7 @@ static int generate_response_grounding(mtmd_cli_context & ctx, int n_predict) {
     }
     LOG("\n");
 
+    llama_set_attn_bidirectional_tail(ctx.lctx, 0); // restore fully-causal for later turns
     llama_batch_free(win);
     llama_batch_free(cat);
 
