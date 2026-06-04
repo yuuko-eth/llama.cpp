@@ -45,6 +45,7 @@ add_library(mtmd
             models/internvl.cpp
             models/kimivl.cpp
             models/kimik25.cpp
+            models/locateanything.cpp
             models/nemotron-v2-vl.cpp
             models/nemotron-omni.cpp
             models/muse-glimmer.cpp
