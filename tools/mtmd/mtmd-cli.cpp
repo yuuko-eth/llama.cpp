@@ -9,6 +9,7 @@
 #include "chat.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "grounding.h"
 
 #include <vector>
 #include <limits.h>
@@ -104,6 +105,12 @@ struct mtmd_cli_context {
     int n_threads    = 1;
     llama_pos n_past = 0;
 
+    // Parallel Box Decoding (grounding) state
+    grounding_mode    gmode = grounding_mode::SLOW;
+    grounding_tokens  gtok;
+    bool              grounding_ok = false; // gmode != SLOW and tokens resolved
+    llama_token       last_token   = -1;    // last token of the current prompt (cache pos n_past-1)
+
     common_debug_cb_user_data cb_data;
 
     mtmd_cli_context(common_params & params) : llama_init(common_init_from_params(params)) {
@@ -144,6 +151,19 @@ struct mtmd_cli_context {
             antiprompt_tokens = common_tokenize(lctx, "ASSISTANT:", false, true);
         } else if (params.chat_template == "deepseek") {
             antiprompt_tokens = common_tokenize(lctx, "###", false, true);
+        }
+
+        // Parallel Box Decoding: opt-in via MTMD_GROUNDING_MODE={fast,hybrid}
+        gmode = grounding_mode_from_env();
+        if (gmode != grounding_mode::SLOW) {
+            if (gtok.resolve(vocab)) {
+                grounding_ok = true;
+                LOG_INF("%s: grounding mode '%s' enabled (Parallel Box Decoding)\n",
+                        __func__, grounding_mode_name(gmode));
+            } else {
+                LOG_ERR("%s: grounding mode '%s' requested but model lacks grounding tokens; "
+                        "falling back to autoregressive decoding\n", __func__, grounding_mode_name(gmode));
+            }
         }
     }
 
@@ -204,7 +224,151 @@ struct mtmd_cli_context {
     }
 };
 
+// Parallel Box Decoding loop (grounding fast/hybrid modes).
+//
+// Per MTP step we decode a non-causal window of [last_real_token, <text_mask> x (n_future-1)]
+// and read all n_future logit rows in one pass, then assemble a bounding box / ref span from
+// them (mtp_decode_step). The window cells are speculative — we drop them with seq_rm and
+// rebuild the KV for the accepted tokens with a small causal "catch-up" decode. HYBRID falls
+// back to plain autoregressive (causal, greedy) decoding on a malformed box and resumes MTP
+// once the box closes (</box>).
+static int generate_response_grounding(mtmd_cli_context & ctx, int n_predict) {
+    const grounding_tokens & tok      = ctx.gtok;
+    const grounding_mode     mode     = ctx.gmode;
+    const int                n_vocab  = llama_vocab_n_tokens(ctx.vocab);
+    const int                n_future = tok.n_future;
+    llama_memory_t           mem      = llama_get_memory(ctx.lctx);
+
+    auto argmax_row = [&](const float * row) -> llama_token {
+        llama_token best = 0;
+        float       bv   = row[0];
+        for (int i = 1; i < n_vocab; ++i) {
+            if (row[i] > bv) { bv = row[i]; best = i; }
+        }
+        return best;
+    };
+
+    llama_tokens generated_tokens;
+    llama_batch  win = llama_batch_init(n_future, 0, 1);     // non-causal MTP window
+    llama_batch  cat = llama_batch_init(n_future + 1, 0, 1); // causal catch-up
+
+    llama_token last_tok = ctx.last_token; // last real token; lives at cache pos n_past-1
+    bool        ar_mode  = false;          // hybrid: currently in AR fallback
+    int         emitted  = 0;
+
+    while (emitted < n_predict && g_is_generating && !g_is_interrupted) {
+        const llama_pos G = ctx.n_past; // positions [0..G-1] are real tokens in the cache
+
+        if (!ar_mode) {
+            // ---- MTP window step (non-causal, bidirectional within the window) ----
+            // drop the cached last token so the window's re-fed copy isn't double-counted
+            llama_memory_seq_rm(mem, 0, G - 1, -1);
+
+            common_batch_clear(win);
+            common_batch_add(win, last_tok, G - 1, {0}, true);          // slot 0: real last token
+            for (int i = 1; i < n_future; ++i) {
+                common_batch_add(win, tok.mask, G - 1 + i, {0}, true);  // slots 1..: <text_mask>
+            }
+
+            llama_set_causal_attn(ctx.lctx, false);
+            const int rc = llama_decode(ctx.lctx, win);
+            llama_set_causal_attn(ctx.lctx, true);
+            if (rc) { LOG_ERR("grounding: window decode failed\n"); break; }
+
+            std::vector<const float *> rows(n_future);
+            for (int i = 0; i < n_future; ++i) {
+                rows[i] = llama_get_logits_ith(ctx.lctx, i);
+            }
+            mtp_step_result res = mtp_decode_step(rows, n_vocab, tok, mode);
+
+            if (std::getenv("MTMD_GROUNDING_DEBUG")) {
+                std::string toks;
+                for (llama_token t : res.tokens) toks += common_token_to_piece(ctx.lctx, t, true);
+                std::string slots;
+                for (int s = 0; s < n_future; ++s) {
+                    const float * row = rows[s];
+                    llama_token a0 = 0, a1 = 0; float v0 = row[0], v1 = -1e30f;
+                    for (int i = 1; i < n_vocab; ++i) {
+                        if (row[i] > v0) { v1 = v0; a1 = a0; v0 = row[i]; a0 = i; }
+                        else if (row[i] > v1) { v1 = row[i]; a1 = i; }
+                    }
+                    slots += " s" + std::to_string(s) + "=[" +
+                             common_token_to_piece(ctx.lctx, a0, true) + "," +
+                             common_token_to_piece(ctx.lctx, a1, true) + "]";
+                }
+                LOG_INF("[mtp] G=%d pattern=%d term=%d tokens='%s' |%s\n",
+                        (int) G, (int) res.pattern, res.is_terminal, toks.c_str(), slots.c_str());
+            }
+
+            // discard the speculative window cells (positions G-1 .. G-1+n_future-1)
+            llama_memory_seq_rm(mem, 0, G - 1, -1);
+
+            if (res.is_terminal || res.tokens.empty()) {
+                break;
+            }
+
+            for (llama_token t : res.tokens) {
+                generated_tokens.push_back(t);
+                LOG("%s", common_token_to_piece(ctx.lctx, t, true).c_str());
+            }
+            fflush(stdout);
+
+            // catch-up: causally rebuild KV for [last_tok, accepted tokens...]
+            common_batch_clear(cat);
+            common_batch_add(cat, last_tok, G - 1, {0}, false);
+            llama_pos p = G;
+            for (size_t i = 0; i < res.tokens.size(); ++i) {
+                const bool need_logits = (i + 1 == res.tokens.size()); // seed AR continuation
+                common_batch_add(cat, res.tokens[i], p++, {0}, need_logits);
+            }
+            if (llama_decode(ctx.lctx, cat)) { LOG_ERR("grounding: catch-up decode failed\n"); break; }
+
+            ctx.n_past = p;
+            last_tok   = res.tokens.back();
+            emitted   += (int) res.tokens.size();
+
+            if (res.need_switch_to_ar) {
+                ar_mode = true;
+            }
+        } else {
+            // ---- AR fallback (hybrid only): causal, greedy, one token at a time ----
+            const llama_token id = argmax_row(llama_get_logits_ith(ctx.lctx, -1));
+            generated_tokens.push_back(id);
+
+            if (id == tok.im_end || llama_vocab_is_eog(ctx.vocab, id)) {
+                break;
+            }
+            LOG("%s", common_token_to_piece(ctx.lctx, id, true).c_str());
+            fflush(stdout);
+            emitted++;
+
+            if (id == tok.box_end) {
+                ar_mode = false; // box closed → resume MTP
+            }
+
+            common_batch_clear(ctx.batch);
+            common_batch_add(ctx.batch, id, ctx.n_past++, {0}, true);
+            if (llama_decode(ctx.lctx, ctx.batch)) { LOG_ERR("grounding: AR decode failed\n"); break; }
+            last_tok = id;
+        }
+    }
+    LOG("\n");
+
+    llama_batch_free(win);
+    llama_batch_free(cat);
+
+    std::string generated_text = common_detokenize(ctx.lctx, generated_tokens);
+    common_chat_msg msg;
+    msg.role    = "assistant";
+    msg.content = generated_text;
+    ctx.chat_history.push_back(std::move(msg));
+    return 0;
+}
+
 static int generate_response(mtmd_cli_context & ctx, int n_predict) {
+    if (ctx.grounding_ok) {
+        return generate_response_grounding(ctx, n_predict);
+    }
     llama_tokens generated_tokens;
     for (int i = 0; i < n_predict; i++) {
         if (i > n_predict || !g_is_generating || g_is_interrupted) {
@@ -315,6 +479,22 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
 
     ctx.bitmaps.entries.clear();
     ctx.videos.clear();
+
+    // capture the last prompt token: it seeds slot 0 of the first MTP window
+    if (ctx.grounding_ok) {
+        size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
+        for (size_t i = n_chunks; i-- > 0; ) {
+            const mtmd_input_chunk * ck = mtmd_input_chunks_get(chunks.ptr.get(), i);
+            if (mtmd_input_chunk_get_type(ck) == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+                size_t n_tok = 0;
+                const llama_token * toks = mtmd_input_chunk_get_tokens_text(ck, &n_tok);
+                if (n_tok > 0) {
+                    ctx.last_token = toks[n_tok - 1];
+                    break;
+                }
+            }
+        }
+    }
 
     // batch encode all media chunks, then decode each
     size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
