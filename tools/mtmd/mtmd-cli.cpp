@@ -259,8 +259,8 @@ static int generate_response_grounding(mtmd_cli_context & ctx, int n_predict) {
     };
 
     llama_tokens generated_tokens;
-    llama_batch  win = llama_batch_init(n_future, 0, 1);     // non-causal MTP window
-    llama_batch  cat = llama_batch_init(n_future + 1, 0, 1); // causal catch-up
+    common_batch win(ctx.lctx); // non-causal MTP window
+    common_batch cat(ctx.lctx); // causal catch-up
 
     llama_token last_tok = ctx.last_token; // last real token; lives at cache pos n_past-1
     bool        ar_mode  = false;          // hybrid: currently in AR fallback
@@ -274,17 +274,17 @@ static int generate_response_grounding(mtmd_cli_context & ctx, int n_predict) {
             // drop the cached last token so the window's re-fed copy isn't double-counted
             llama_memory_seq_rm(mem, 0, G - 1, -1);
 
-            common_batch_clear(win);
-            common_batch_add(win, last_tok, G - 1, {0}, true);          // slot 0: real last token
+            win.clear();
+            win.add(last_tok, G - 1, 0, true);          // slot 0: real last token
             for (int i = 1; i < n_future; ++i) {
-                common_batch_add(win, tok.mask, G - 1 + i, {0}, true);  // slots 1..: <text_mask>
+                win.add(tok.mask, G - 1 + i, 0, true);  // slots 1..: <text_mask>
             }
 
             // the n_future window tokens attend to each other bidirectionally (a
             // non-causal block) while staying causal to the prefix. This only changes
             // KQ-mask values, so it does not re-reserve the graph between decodes.
             llama_set_attn_bidirectional_tail(ctx.lctx, n_future);
-            const int rc = llama_decode(ctx.lctx, win);
+            const int rc = llama_process(ctx.lctx, LLAMA_PROCESS_TYPE_DECODE, win.get());
             if (rc) { LOG_ERR("grounding: window decode failed\n"); break; }
 
             std::vector<const float *> rows(n_future);
@@ -328,14 +328,14 @@ static int generate_response_grounding(mtmd_cli_context & ctx, int n_predict) {
             // catch-up: causally rebuild KV for [last_tok, accepted tokens...].
             // tail=0 → fully causal so the committed tokens get faithful causal KV.
             llama_set_attn_bidirectional_tail(ctx.lctx, 0);
-            common_batch_clear(cat);
-            common_batch_add(cat, last_tok, G - 1, {0}, false);
+            cat.clear();
+            cat.add(last_tok, G - 1, 0, false);
             llama_pos p = G;
             for (size_t i = 0; i < res.tokens.size(); ++i) {
                 const bool need_logits = (i + 1 == res.tokens.size()); // seed AR continuation
-                common_batch_add(cat, res.tokens[i], p++, {0}, need_logits);
+                cat.add(res.tokens[i], p++, 0, need_logits);
             }
-            if (llama_decode(ctx.lctx, cat)) { LOG_ERR("grounding: catch-up decode failed\n"); break; }
+            if (llama_process(ctx.lctx, LLAMA_PROCESS_TYPE_DECODE, cat.get())) { LOG_ERR("grounding: catch-up decode failed\n"); break; }
 
             ctx.n_past = p;
             last_tok   = res.tokens.back();
@@ -360,17 +360,15 @@ static int generate_response_grounding(mtmd_cli_context & ctx, int n_predict) {
                 ar_mode = false; // box closed → resume MTP
             }
 
-            common_batch_clear(ctx.batch);
-            common_batch_add(ctx.batch, id, ctx.n_past++, {0}, true);
-            if (llama_decode(ctx.lctx, ctx.batch)) { LOG_ERR("grounding: AR decode failed\n"); break; }
+            ctx.batch.clear();
+            ctx.batch.add(id, ctx.n_past++, 0, true);
+            if (llama_process(ctx.lctx, LLAMA_PROCESS_TYPE_DECODE, ctx.batch.get())) { LOG_ERR("grounding: AR decode failed\n"); break; }
             last_tok = id;
         }
     }
     LOG("\n");
 
     llama_set_attn_bidirectional_tail(ctx.lctx, 0); // restore fully-causal for later turns
-    llama_batch_free(win);
-    llama_batch_free(cat);
 
     std::string generated_text = common_detokenize(ctx.lctx, generated_tokens);
     common_chat_msg msg;
